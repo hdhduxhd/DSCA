@@ -56,16 +56,16 @@ python main.py --device your_device --config configs/mimg20_dsca.json
 python main.py --device your_device --config configs/mimg50_dsca.json 
 ```
 
-### ImageNet-A:
-#### For DSCA
-```
-python main.py --device your_device --config configs/mimg_a_dsca.json 
-```
-
 ### CIFAR100:
 #### For DSCA
 ```
 python main.py --device your_device --config configs/cifar100_dsca.json 
+```
+
+### ImageNet-A:
+#### For DSCA
+```
+python main.py --device your_device --config configs/mimg_a_dsca.json 
 ```
 
 ## Acknoledgements
