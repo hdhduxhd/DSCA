@@ -55,7 +55,6 @@ def _train(args):
     model = factory.get_model(args['model_name'], args)
 
     cnn_curve, cnn_curve_with_task, nme_curve, cnn_curve_task = {'top1': []}, {'top1': []}, {'top1': []}, {'top1': []}
-    # 新增 ridge curve
     ridge_curve = {'top1': []}
     for task in range(data_manager.nb_tasks):
         logging.info('All params: {}'.format(count_parameters(model._network)))

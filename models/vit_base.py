@@ -275,29 +275,6 @@ class Attention_LoRA(nn.Module):
         return weight_k, weight_v
     
 
-def FFT_SHIFT(matrix):
-        m_clone = matrix.clone()
-        m,n = m_clone.shape
-        m = int(m / 2)
-        n = int(n / 2)
-
-        for i in range(m):
-            for j in range(n):
-                m_clone[i][j] = matrix[m+i][n+j]
-                m_clone[m+i][n+j] = matrix[i][j]
-                m_clone[m+i][j] = matrix[i][j+n]
-                m_clone[i][j+n] = matrix[m+i][j]
-        return m_clone
-
-class ParameterWrapper(nn.Module):
-    def __init__(self, param):
-        super(ParameterWrapper, self).__init__()
-        self.weight = param
-    
-    def forward(self, x):
-        # print('x, param', x.device(), self.pram.device())
-        return F.linear(x, torch.diag(self.weight))
-
 class Attention_LoRA_FFT(Attention_LoRA):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., r=64, n_tasks=10, n_frq=3000):
         super().__init__(dim, num_heads, qkv_bias, qk_scale, attn_drop, proj_drop, r, n_tasks)
@@ -306,312 +283,12 @@ class Attention_LoRA_FFT(Attention_LoRA):
         self.coef_k = nn.ParameterList([nn.Parameter(torch.randn(self.n_frq), requires_grad=True) for _ in range(n_tasks)]).to(self.qkv.weight.device)
         self.coef_v = nn.ParameterList([nn.Parameter(torch.randn(self.n_frq), requires_grad=True) for _ in range(n_tasks)]).to(self.qkv.weight.device)
 
-        # self.S_trans_k = nn.ModuleList([ParameterWrapper(nn.Parameter(torch.Tensor([0.0 for _ in range(self.dim)]))) for _ in range(n_tasks)])
-        # self.S_trans_v = nn.ModuleList([ParameterWrapper(nn.Parameter(torch.Tensor([0.0 for _ in range(self.dim)]))) for _ in range(n_tasks)])
-
         self.indices = [self.select_pos(t, self.dim).to(self.qkv.weight.device) for t in range(n_tasks)]
-        b = self.dct_matrix(self.dim)
-        self.bases = [b for _ in range(n_tasks)]
-        # self.bases_trans = [torch.zeros(self.dim, self.dim) for _ in range(n_tasks)]
 
         self.MoE = False
         if self.MoE:
             self.gate = nn.Linear(self.dim, n_tasks)
 
-        # 新增：用于累积当前任务的统计信息
-        self.new_cur_matrix = None
-        self.n_new_cur_matrix = 0
-
-        # 新增，统计量
-        self.fft_cur_matrix = None
-        self.n_fft_cur_matrix = 0
-
-        # 新增：安全频点掩码
-        self.safe_mask = None
-        
-        # 新增：存储ATL相关的梯度
-        self.atl_grad_k = None
-        self.atl_grad_v = None
-        
-        # 新增：存储所有任务的统计信息
-        self.saved_list = []
-
-        # 新增：存储所有任务的列范数
-        self.all_col_norms = {}
-           
-    def dct_matrix(self, n):
-        """生成n×n的DCT变换矩阵"""
-        matrix = torch.zeros(n, n)
-        
-        for i in range(n):
-            for j in range(n):
-                if i == 0:
-                    matrix[i, j] = math.sqrt(1/n)
-                else:
-                    matrix[i, j] = math.sqrt(2/n) * math.cos(math.pi * i * (2*j + 1) / (2*n))
-        
-        return matrix
-    
-    # ---------- saving at old task end ----------
-    def save_task_statistics(self, B_ref=None, mode='full', rank=None):
-        """
-        Called at end of old task to save compact info for later influence computation.
-        X_t: training data for task t in shape (M_t, d)
-        B_ref: (d, k_r) or None (identity)
-        B_t:   (d, k_t)  (task basis) - only needed if you want extra things
-        mode: 'full'|'diag'|'lowrank'
-        Returns a dict to save to disk.
-        """
-        X_t = self.new_cur_matrix
-        device = X_t.device
-        d = X_t.shape[1]
-        if B_ref is None:
-            # B_ref == I_d
-            k_r = d
-            # C = B_ref^T X^T X B_ref = X^T X  (d x d)
-            # D = B_ref^T B_ref = I_d
-            # Compute XtX = X_t^T @ X_t
-            XtX = X_t.T @ X_t  # (d,d)
-            if mode == 'full':
-                self.saved_list.append({'C': XtX.cpu(), 'D': torch.eye(k_r).cpu(), 'mode':'full'})
-            elif mode == 'diag':
-                self.saved_list.append({'C_diag': torch.diag(XtX).cpu(), 'D_diag': torch.ones(k_r).cpu(), 'mode':'diag'})
-            elif mode == 'lowrank':
-                U, s, Vh = torch.linalg.svd(XtX, full_matrices=False)
-                r = min(rank, s.shape[0])
-                self.saved_list.append({'U': U[:, :r].cpu(), 's': s[:r].cpu(), 'Vh': Vh[:r,:].cpu(), 'mode':'lowrank'})
-        else:
-            # general B_ref: compute C = B_ref^T X^T X B_ref
-            k_r = B_ref.shape[1]
-            BR = B_ref.to(device)
-            # Compute XBR = X @ BR  -> (M_t, k_r)
-            XBR = X_t @ BR
-            C = XBR.T @ XBR  # (k_r, k_r)
-            D = BR.T @ BR    # (k_r, k_r)
-            if mode == 'full':
-                self.saved_list.append({'C': C.cpu(), 'D': D.cpu(), 'mode':'full'})
-            elif mode == 'diag':
-                self.saved_list.append({'C_diag': torch.diag(C).cpu(), 'D_diag': torch.diag(D).cpu(), 'mode':'diag'})
-            elif mode == 'lowrank':
-                U, s, Vh = torch.linalg.svd(C, full_matrices=False)
-                r = min(rank, s.shape[0])
-                self.saved_list.append({'U': U[:, :r].cpu(), 's': s[:r].cpu(), 'Vh': Vh[:r,:].cpu(), 'D': D.cpu(), 'mode':'lowrank'})
-        
-        # 重置统计
-        self.new_cur_matrix.zero_()
-        self.n_new_cur_matrix = 0
-
-    def compute_S(self, task_id):
-        assert self.new_cur_matrix is not None, "cur_matrix 为空，请先累积统计信息"
-        # 计算当前任务范数
-        B = self.bases[task_id].to(self.qkv.weight.device)  # (dim, k)
-        U = self.new_cur_matrix @ B # (patch, k)
-        alpha = (U * U).sum(dim=0)   # (k,)
-        beta = (B * B).sum(dim=0)  # (k,)
-        current_S2 = alpha.unsqueeze(1) * beta.unsqueeze(0)  # (k, k)  ; S2[p,q] = alpha[p] * beta[q]
-        # 重置统计
-        self.new_cur_matrix.zero_()
-        self.n_new_cur_matrix = 0
-        return current_S2
-
-    # ---------- utils ----------
-    def compute_R(self, task_id, B_ref=None, method='pinv'):
-        # B_ref: (d, k_r) or None -> identity
-        B_t = self.bases[task_id]
-        # B_t:   (d, k_t)
-        if B_ref is None:
-            # Reference is identity: R = B_t (shape d x k_t), but we'll keep k_r = d
-            return B_t  # shape (d, k_t)
-        else:
-            # Solve B_ref @ R = B_t  => R = pinv(B_ref) @ B_t  (shape k_r x k_t)
-            if method == 'pinv':
-                return torch.linalg.pinv(B_ref) @ B_t
-            else:
-                return torch.linalg.lstsq(B_ref, B_t).solution
-    
-    # ---------- in new task: compute influence & select ----------
-    def compute_old_influence_for_current(self, R_curr, mode='full'):
-        """
-        R_curr: (k_r, k_c) if B_ref given; if B_ref None, R_curr = B_curr (d x k_c)
-        saved_list: list of dicts returned from save_task_statistics for each old task.
-        Returns aggregated influence tensor I_old (k_c, k_c) for the new task.
-        mode: how saved stats were stored: 'full'|'diag'|'lowrank' (should match saved)
-        """
-        # R_curr: shape (k_r, k_c)  OR (d, k_c) if identity (we'll treat as (k_r, k_c))
-        device = R_curr.device
-        k_r, k_c = R_curr.shape
-        # Precompute D or D_diag if available (D = B_ref^T B_ref). If B_ref is None, D = I
-        # We'll compute per saved entry and sum/aggregate afterwards.
-        # We'll compute for each old task matrix of size (k_c, ), namely
-        # A_p = r_p^T C r_p  for all p -> vector a of length k_c
-        # B_q = r_q^T D r_q  for all q -> vector b of length k_c
-        # Then I_{pq}^2 = a_p * b_q  (outer product)
-        # We'll aggregate a and b over tasks (e.g., max or sum)
-        # Initialize aggregated a_agg and b_agg
-        # We'll use sum-of-squares aggregation by default (user can choose)
-        a_agg = torch.zeros(k_c, device=device)
-        b_agg = torch.zeros(k_c, device=device)
-        for s in self.saved_list:
-            m = s['mode']
-            if m == 'full':
-                C = s['C'].to(device)   # (k_r, k_r)
-                D = s['D'].to(device)   # (k_r, k_r)
-                # compute a_p = diag(R^T C R)  where R is R_curr
-                # R_curr: (k_r, k_c) => R^T C R => (k_c, k_c), diag gives a vector
-                # but more efficient: compute (C R) -> (k_r, k_c) then elementwise (R * (C R)).sum(dim=0)
-                CR = C @ R_curr   # (k_r, k_c)
-                a = (R_curr * CR).sum(dim=0)  # (k_c,)
-                DR = D @ R_curr
-                b = (R_curr * DR).sum(dim=0)
-            elif m == 'diag':
-                Cdiag = s['C_diag'].to(device)  # (k_r,)
-                Ddiag = s['D_diag'].to(device)
-                # approximate r^T C r ≈ sum_i Cii * r_i^2
-                a = (R_curr**2).T @ Cdiag   # (k_c,)
-                b = (R_curr**2).T @ Ddiag
-            elif m == 'lowrank':
-                # C ≈ U S U^T
-                # r^T C r = (U^T r)^T diag(s) (U^T r) = sum_j s_j * (u_j^T r)^2
-                U = s['U'].to(device)   # (k_r, r)
-                sval = s['s'].to(device) # (r,)
-                Vh = s.get('Vh', None)
-                # compute projections P = U^T R_curr  -> (r, k_c)
-                P = U.T @ R_curr
-                a = (sval.unsqueeze(1) * (P**2)).sum(dim=0)  # (k_c,)
-                # for D we may or may not have; try D if provided else assume diag approx
-                if 'D' in s:
-                    D = s['D'].to(device)
-                    DR = D @ R_curr
-                    b = (R_curr * DR).sum(dim=0)
-                else:
-                    raise ValueError("lowrank saved without D")
-            else:
-                raise ValueError("unknown saved mode")
-            # aggregate - here we do sum of squared influences (can change to max)
-            a_agg += a  # sum
-            b_agg += b
-        # Now aggregated I_old^2 = outer(a_agg, b_agg)
-        I_old2 = torch.outer(a_agg/len(self.saved_list), b_agg/len(self.saved_list))  # shape (k_c, k_c)
-        # I_old = torch.sqrt(I_old2 + 1e-12)
-        return I_old2
-    
-    def select_candidates(self, task_id, topK_ratio=0.3, lambda_reg=1e-6):
-        """
-        Combine current sensitivity S_curr (k_c,k_c) and old influence I_old (k_c,k_c)
-        to produce a score and select topK positions to update.
-        S_curr: current task sensitivity magnitude matrix (not squared)  (k_c,k_c)
-        I_old:   computed aggregated old influence matrix (k_c,k_c)
-        """
-        topK = int(self.bases[task_id].shape[1] * self.bases[task_id].shape[1] * topK_ratio)
-        S_curr = self.compute_S(task_id)
-        R_curr = self.compute_R(task_id)
-        I_old = self.compute_old_influence_for_current(R_curr)
-        I_old = I_old.to(S_curr.device)
-
-        score = S_curr / (lambda_reg + I_old)
-        flat = score.reshape(-1)
-        vals, idx = torch.topk(flat, k=topK, largest=True)
-        k_c = S_curr.shape[0]
-        ps = (idx // k_c).cpu().long()
-        qs = (idx % k_c).cpu().long()
-
-        # 创建安全频点掩码
-        # 创建二维安全掩码矩阵
-        self.safe_mask_2d = torch.zeros((k_c, k_c), device=self.coef_k[0].device)
-        self.safe_mask_2d[ps, qs] = 1
-
-        self.safe_mask = self.safe_mask_2d[self.indices[task_id][0], self.indices[task_id][1]]
-        logging.info(f"Task {task_id}: Selected top-{self.safe_mask.sum()} safe frequency positions for ATL.")
-
-    def save_col_norms(self, task_id):
-        assert self.fft_cur_matrix is not None, "fft_cur_matrix 为空，请先累积统计信息"
-
-        # 计算列范数
-        B_x = self.fft_cur_matrix / max(1, self.n_fft_cur_matrix)
-        col_norms = B_x.abs().norm(dim=0)  # shape [dim]
-
-        # 保存当前任务的列范数
-        self.all_col_norms[task_id] = col_norms.cpu()
-
-        # 重置统计
-        self.fft_cur_matrix.zero_()
-        self.n_fft_cur_matrix = 0
-    
-    def compute_agg_col_norms(self):
-        assert self.fft_cur_matrix is not None, "fft_cur_matrix 为空，请先累积统计信息"
-        # 计算当前任务列范数
-        B_x = self.fft_cur_matrix / max(1, self.n_fft_cur_matrix)
-        current_col_norms = B_x.abs().norm(dim=0).cpu()  # shape [dim]
-        # ===== 聚合策略 =====
-        # 取所有任务的列范数的最大值（保守）
-        # agg_col_norms = torch.stack(list(self.all_col_norms.values()), dim=0).max(dim=0)[0]
-        # 取所有任务的列范数的平均值（折中）
-        if not hasattr(self, "all_col_norms") or len(self.all_col_norms) == 0:
-            return -1 * current_col_norms  # 如果没有历史任务，返回负当前列范数，表示优先选择当前最小的列
-        agg_col_norms = torch.stack(list(self.all_col_norms.values()), dim=0).mean(dim=0)
-        agg_col_norms = agg_col_norms - current_col_norms
-        return agg_col_norms
-
-    # 改进的方法：计算相对安全列
-    def finalize_safe_mask(self, task_id, r=50):
-        """
-        计算相对安全列（取范数最小的 r 列）
-        """
-        assert task_id > 0, "任务ID应从1开始"
-        
-        agg_col_norms = self.compute_agg_col_norms()
-        # 找到最小的 r 列
-        safe_cols = torch.argsort(agg_col_norms)[:r]
-        # 创建安全频点掩码
-        # 创建二维安全掩码矩阵
-        self.safe_mask_2d = torch.zeros((self.dim, self.dim), device=self.coef_k[0].device)
-        # 对于每个安全列q，标记行q为安全
-        for q in safe_cols:
-            self.safe_mask_2d[q, ] = 1
-
-        self.safe_mask = self.safe_mask_2d[self.indices[task_id][0], self.indices[task_id][1]]
-        logging.info(f'[Task {task_id}] 选择 {r} 个最安全的行，对应 {int(self.safe_mask.sum().item())} 个安全频点')
-
-        # 重置统计
-        self.fft_cur_matrix.zero_()
-        self.n_fft_cur_matrix = 0
-
-    # 保存ATL相关的梯度
-    def save_atl_grad(self, task_id):
-        """保存ATL相关的梯度"""
-        if self.coef_k[task_id].grad is not None:
-            self.atl_grad_k = self.coef_k[task_id].grad.clone()
-        if self.coef_v[task_id].grad is not None:
-            self.atl_grad_v = self.coef_v[task_id].grad.clone()
-    
-    # 应用安全频点掩码到ATL梯度
-    def apply_safe_mask_to_atl_grad(self, task_id):
-        """应用安全频点掩码到ATL梯度"""
-        if self.atl_grad_k is not None and self.safe_mask is not None:
-            # 应用安全掩码到ATL梯度
-            safe_atl_grad_k = self.atl_grad_k * self.safe_mask
-            
-            # 如果已经有其他梯度，需要合并
-            if self.coef_k[task_id].grad is not None:
-                # 减去原始的ATL梯度，加上安全版本的ATL梯度
-                self.coef_k[task_id].grad = self.coef_k[task_id].grad - self.atl_grad_k + safe_atl_grad_k
-            else:
-                self.coef_k[task_id].grad = safe_atl_grad_k
-                
-        if self.atl_grad_v is not None and self.safe_mask is not None:
-            # 应用安全掩码到ATL梯度
-            safe_atl_grad_v = self.atl_grad_v * self.safe_mask
-            
-            # 如果已经有其他梯度，需要合并
-            if self.coef_v[task_id].grad is not None:
-                # 减去原始的ATL梯度，加上安全版本的ATL梯度
-                self.coef_v[task_id].grad = self.coef_v[task_id].grad - self.atl_grad_v + safe_atl_grad_v
-            else:
-                self.coef_v[task_id].grad = safe_atl_grad_v
-                
-        # 清空ATL梯度
-        self.atl_grad_k = None
-        self.atl_grad_v = None
 
     def init_param(self):
         for t in range(len(self.coef_k)):
@@ -620,118 +297,45 @@ class Attention_LoRA_FFT(Attention_LoRA):
             nn.init.zeros_(self.coef_v[t])
 
     def add_task_parameters(self, task_id, n_frq):
-        """为指定任务初始化参数"""
-            
-        # 初始化当前任务的参数
         device = self.qkv.weight.device
         coef_k = nn.Parameter(torch.zeros(n_frq, device=device), requires_grad=True)
         coef_v = nn.Parameter(torch.zeros(n_frq, device=device), requires_grad=True)
         
-        # 添加到参数列表
         self.coef_k.append(coef_k)
         self.coef_v.append(coef_v)
         
     def select_pos(self, t, dim, n_frq=None, seed=777):
-        # 如果没有指定 n_frq，使用默认 self.n_frq
         target_n_frq = n_frq if n_frq is not None else self.n_frq
         
         indices = torch.randperm(dim * dim, generator=torch.Generator().manual_seed(seed+t*10))[:target_n_frq]
         indices = torch.stack([indices // dim, indices % dim], dim=0)
         return indices
 
-    # [新增] GCV 引导的核心：动态调整指定任务的容量
     def resize_task_capacity(self, task_id, new_n_frq):
-        """
-        根据 GCV 反馈，调整特定任务的频率分量数量。
-        """
         if task_id >= len(self.coef_k):
-            return # 还没初始化这个任务，忽略
+            return
 
         logging.info(f"Dynamic Resizing: Task {task_id} capacity {self.coef_k[task_id].shape[0]} -> {new_n_frq}")
         device = self.qkv.weight.device
         
-        # 1. 重新生成对应数量的频率索引
         new_indices = self.select_pos(task_id, self.dim, n_frq=new_n_frq).to(device)
         self.indices[task_id] = new_indices
         
-        # 2. 重新初始化参数 (Parameter)
-        # 注意：这里是重置参数，因为结构变了。通常在任务开始训练前调用。
         self.coef_k[task_id] = nn.Parameter(torch.zeros(new_n_frq, device=device), requires_grad=True)
         self.coef_v[task_id] = nn.Parameter(torch.zeros(new_n_frq, device=device), requires_grad=True)
-
-    # [新增] 频谱侦察与重置
-    def probe_and_select_best_frequencies(self, task_id, gradient_matrix, k):
-        """
-        根据计算出的梯度矩阵 (Dim, Dim)，选择梯度最大的 k 个位置作为当前任务的 indices
-        """
-        device = self.qkv.weight.device
-        
-        # 1. 计算梯度显著性 (Saliency)
-        # gradient_matrix: (Dim, Dim)
-        saliency = gradient_matrix.abs()
-        
-        # 2. 选取 Top-K 索引
-        # flatten 后取 topk
-        flat_saliency = saliency.flatten()
-
-        # [新增] 屏蔽旧任务已占用的频点 (Masking)
-        if task_id > 0:
-            # 遍历之前所有任务
-            for t in range(task_id):
-                prev_indices = self.indices[t] # Shape: (2, k_prev)
-                if prev_indices is None: continue
-                
-                # 将二维坐标转换为扁平坐标: idx = row * dim + col
-                flat_prev_indices = prev_indices[0] * self.dim + prev_indices[1]
-                
-                # 将这些位置的显著性设为负无穷，确保 topk 绝对不会选中它们
-                flat_saliency[flat_prev_indices] = -float('inf')
-
-        _, topk_indices_flat = torch.topk(flat_saliency, k)
-        
-        # 转回 (2, k) 坐标
-        # row = idx // dim, col = idx % dim
-        rows = topk_indices_flat // self.dim
-        cols = topk_indices_flat % self.dim
-        new_indices = torch.stack([rows, cols], dim=0).to(device)
-        
-        # 3. 更新 BiLoRA 的 indices
-        self.indices[task_id] = new_indices
-        
-        # 4. 重置参数
-        # 既然位置变了，参数必须重置为 0
-        nn.init.zeros_(self.coef_k[task_id])
-        nn.init.zeros_(self.coef_v[task_id])
-        
-        # 清除梯度，防止干扰后续训练
-        if self.coef_k[task_id].grad is not None:
-            self.coef_k[task_id].grad = None
-        if self.coef_v[task_id].grad is not None:
-            self.coef_v[task_id].grad = None
-            
-        return new_indices
+    
 
     def get_delta_w_k(self, task, alpha=300):
         indices = self.indices[task]
-        dim = self.bases[task].shape[1]
-        # F = torch.zeros(dim, dim).to(self.qkv.weight.device)
         F = torch.zeros(self.dim, self.dim).to(self.qkv.weight.device)
         F[indices[0,:], indices[1,:]] =  self.coef_k[task]
         return torch.fft.ifft2(F, dim=(-2,-1)).real * alpha
-        base = self.bases[task].to(self.qkv.weight.device)
-        # base_trans = self.bases_trans[task].to(self.qkv.weight.device)
-        return base @ F @ base.t()# + base_trans @ torch.diag(self.S_trans_k[task].weight) @ base_trans.t()
     
     def get_delta_w_v(self, task, alpha=300):
         indices = self.indices[task]
-        dim = self.bases[task].shape[1]
-        # F = torch.zeros(dim, dim).to(self.qkv.weight.device)
         F = torch.zeros(self.dim, self.dim).to(self.qkv.weight.device)
         F[indices[0,:], indices[1,:]] =  self.coef_v[task]
         return torch.fft.ifft2(F, dim=(-2,-1)).real * alpha
-        base = self.bases[task].to(self.qkv.weight.device)
-        # base_trans = self.bases_trans[task].to(self.qkv.weight.device)
-        return base @ F @ base.t()# + base_trans @ torch.diag(self.S_trans_v[task].weight) @ base_trans.t()
     
     def get_pre_matrix(self, task):
         with torch.no_grad():
@@ -739,33 +343,10 @@ class Attention_LoRA_FFT(Attention_LoRA):
             weight_v = torch.stack([self.get_delta_w_k(t) for t in range(task)], dim=0).sum(dim=0)
         return weight_k, weight_v
 
-    def forward(self, x, task, register_hook=False, get_feat=False,get_cur_feat=False, get_cur_x=False, alpha=1.0):
+    def forward(self, x, task, register_hook=False, get_feat=False):
         if get_feat:
             self.matrix = (self.matrix*self.n_matrix + torch.bmm(x.detach().permute(0, 2, 1), x.detach()).sum(dim=0).cpu())/(self.n_matrix + x.shape[0]*x.shape[1])
             self.n_matrix += x.shape[0]*x.shape[1]
-        if get_cur_feat:
-            # if self.new_cur_matrix is None:
-            #     self.new_cur_matrix = x.mean(dim=0)
-            # else:
-            #     self.new_cur_matrix = (self.new_cur_matrix*self.n_new_cur_matrix + x.sum(dim=0))/(self.n_new_cur_matrix + x.shape[0])
-            # self.n_new_cur_matrix += x.shape[0]
-
-            # # 保存 fft_cur_matrix = FFT(x) 的统计信息
-            # x_fft = x @ self.bases[task].to(x.device)
-            # if self.fft_cur_matrix is None:
-            #     self.fft_cur_matrix = x_fft.sum(dim=0)
-            # else:
-            #     self.fft_cur_matrix += x_fft.sum(dim=0)
-            # self.n_fft_cur_matrix += x.shape[0]
-
-            # 保存 fft_cur_matrix = FFT(x) 的统计信息
-            with torch.no_grad():
-                x_fft = torch.fft.fft2(x)
-                if self.fft_cur_matrix is None:
-                    self.fft_cur_matrix = x_fft.sum(dim=0)
-                else:
-                    self.fft_cur_matrix += x_fft.sum(dim=0)
-                self.n_fft_cur_matrix += x.shape[0]
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -790,24 +371,11 @@ class Attention_LoRA_FFT(Attention_LoRA):
 
         else:
         # insert lora   
-            if get_cur_x:
-                rate = 1
-                self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + torch.bmm(x0.detach().permute(0, 2, 1),
-                                                                                x0.detach()).sum(dim=0).cpu()) / (
-                                            rate * (self.n_cur_matrix + x0.shape[0] * x0.shape[1]))
-                self.n_cur_matrix += x0.shape[0] * x0.shape[1]
-
-                if task > 0:
-                    weight_k_old = torch.stack([self.get_delta_w_k(t) for t in range(task)], dim=0).sum(dim=0)
-                    weight_v_old = torch.stack([self.get_delta_w_v(t) for t in range(task)], dim=0).sum(dim=0)
-                    k = k - alpha * F.linear(x, weight_k_old).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-                    v = v - alpha * F.linear(x, weight_v_old).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            else:
-                if task > -0.5:
-                    weight_k = torch.stack([self.get_delta_w_k(t) for t in range(task+1)], dim=0).sum(dim=0)
-                    weight_v = torch.stack([self.get_delta_w_v(t) for t in range(task+1)], dim=0).sum(dim=0)
-                k = k + F.linear(x, weight_k).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-                v = v + F.linear(x, weight_v).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            if task > -0.5:
+                weight_k = torch.stack([self.get_delta_w_k(t) for t in range(task+1)], dim=0).sum(dim=0)
+                weight_v = torch.stack([self.get_delta_w_v(t) for t in range(task+1)], dim=0).sum(dim=0)
+            k = k + F.linear(x, weight_k).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v = v + F.linear(x, weight_v).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -851,8 +419,8 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, task, register_hook=False, get_feat=False, get_cur_feat=False, get_cur_x=False, alpha=1):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), task, register_hook=register_hook, get_feat=get_feat, get_cur_feat=get_cur_feat, get_cur_x=get_cur_x, alpha=alpha)))
+    def forward(self, x, task, register_hook=False, get_feat=False):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), task, register_hook=register_hook, get_feat=get_feat)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
     

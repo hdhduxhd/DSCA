@@ -14,7 +14,6 @@ from models.fft import SiNet
 from models.vit_base import Attention_LoRA_FFT
 from utils.schedulers import CosineSchedule
 
-# 辅助函数：生成 one-hot 标签
 def target2onehot(targets, n_classes):
     onehot = torch.zeros(targets.shape[0], n_classes).to(targets.device)
     onehot.scatter_(1, targets.long().view(-1, 1), 1)
@@ -66,28 +65,19 @@ class DSCA(BaseLearner):
             self.logit_norm = 0.1
         self.task_sizes = []
 
-        # ===== Fly-CL Initialization =====
+        # ===== Random Sparse Projection Initialization =====
         self.expand_dim = self.args['expand_dim']
         self.embd_dim = self.args['embd_dim']
         self.synaptic_degree = self.args['synaptic_degree']
         
-        # 初始化冻结的投影矩阵
         self.projection_matrix = torch.zeros(self.expand_dim, self.embd_dim)
         for row in range(self.expand_dim):
             selected_cols = torch.randperm(self.embd_dim)[:self.synaptic_degree]
             self.projection_matrix[row, selected_cols] = torch.randn(self.synaptic_degree)
         self.projection_matrix = self.projection_matrix.to(self._device).to_sparse()
-        # self.projection_matrix_temp = self.projection_matrix.clone()
         
-        # 初始化统计矩阵
         self._G = torch.zeros(self.expand_dim, self.expand_dim).to(self._device)
-        # self._G_temp = torch.zeros(self.expand_dim, self.expand_dim).to(self._device)
-        # _Q 需要随着类别增长而动态扩展，初始化为0大小
         self._Q = None 
-        # self._Q_temp = None
-
-        self._proj_class_means = None # 存储投影后的均值
-        self._proj_class_covs = None  # 存储投影后的协方差 (建议存对角线以节省显存)
 
     def after_task(self):
     
@@ -105,13 +95,8 @@ class DSCA(BaseLearner):
             logging.info(f"Applying dynamic capacity {self.next_task_capacity} for Task {self._cur_task}")
             for m in self._network.modules():
                 if isinstance(m, Attention_LoRA_FFT):
-                    # 调整当前任务的参数大小
                     m.resize_task_capacity(self._cur_task, self.next_task_capacity)
 
-        # self._G = self._G_temp
-        # self._Q = self._Q_temp
-        # self.projection_matrix = self.projection_matrix_temp
-        # 更新 _Q 矩阵大小以适应新类别
         if self._Q is None:
             self._Q = torch.zeros(self.expand_dim, self._total_classes).to(self._device)
         else:
@@ -129,18 +114,11 @@ class DSCA(BaseLearner):
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source='test', mode='test')
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False,
                                       num_workers=self.num_workers)
-        
-        # [新增] 频谱侦察
-        # 必须在 optimizer 初始化之前调用！因为我们会重置 Parameter
-        # 这里的 train_loader 是新任务的数据
-        # self.perform_spectral_scouting(self.train_loader)
 
         self._train(self.train_loader, self.test_loader)
         # ===== Update Fly-CL Statistics after backbone training =====
-        # BiLoRA 对骨干网络进行了微调，因此需要在训练完成后提取特征更新 G 和 Q
         logging.info("Updating Fly-CL statistics (Streaming Ridge)...")
         self._update_flycl_statistics(self.train_loader)
-        # ==========================================================
         if self.args["GCVD"]:
             self.adjust_capacity_for_next_task()
 
@@ -200,19 +178,6 @@ class DSCA(BaseLearner):
             self.train_function(train_loader, test_loader, optimizer, scheduler)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
-
-        if self.args['SFT']:
-            with torch.no_grad():
-                for i, (_, inputs, targets) in enumerate(train_loader):
-                    inputs, targets = inputs.to(self._device), targets.to(self._device)
-                    self._network(inputs, get_cur_feat=True)
-                    # if i > 3: break
-                # for module in self._network.modules():
-                #     if isinstance(module, Attention_LoRA_FFT):
-                #         module.save_task_statistics()
-                for module in self._network.modules():
-                    if isinstance(module, Attention_LoRA_FFT):
-                        module.save_col_norms(self._cur_task)
 
         return
 
@@ -398,30 +363,24 @@ class DSCA(BaseLearner):
             self._class_means[class_idx, :] = class_mean
             self._class_covs[class_idx, ...] = class_cov
 
-    # ================= [修改] 先收集特征做 GCV，再流式更新 =================
     def _update_flycl_statistics(self, loader):
         self._network.eval()
         if self.projection_matrix.device != self._device:
             self.projection_matrix = self.projection_matrix.to(self._device)
 
-        # [新增] 确保 class_counts 在正确的设备上
         if self.class_counts.device != self._device:
             self.class_counts = self.class_counts.to(self._device)
             
         all_sparse_feats = []
         all_targets = []
         
-        # 1. 收集所有数据特征（用于 GCV SVD）
-        # 注意：如果显存爆了，可以只取前 N 个 batch
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
                 targets = targets.to(self._device)
 
-                # [新增] 更新类别样本计数
                 for t in targets:
                     if t >= len(self.class_counts):
-                        # 动态扩展 counts 数组
                         new_counts = torch.zeros(max(t.item() + 1, len(self.class_counts) * 2), device=self._device).long()
                         new_counts[:len(self.class_counts)] = self.class_counts
                         self.class_counts = new_counts
@@ -432,8 +391,6 @@ class DSCA(BaseLearner):
                 else:
                     features = self._network.extract_vector(inputs)
 
-                # [关键修改] 强 L2 归一化
-                # 确保每个样本在 Ridge 空间的贡献权重是相等的
                 # features = F.normalize(features, p=2, dim=1)
                 
                 # Sparse Projection & Top-K
@@ -446,22 +403,13 @@ class DSCA(BaseLearner):
                 all_sparse_feats.append(sparse_feats)
                 all_targets.append(targets)
                 
-        # 2. 拼接数据
         H = torch.cat(all_sparse_feats, dim=0) # [Total_Samples, Expand_Dim]
         Y_idx = torch.cat(all_targets, dim=0)
         Y = target2onehot(Y_idx, self._total_classes)
         
-        # 3. 执行 GCV 选择最佳 Ridge Lambda
         logging.info(f"Running GCV on {H.shape[0]} samples...")
-        # select_ridge_parameter 需要 Dense Tensor 进行 SVD
-        # Fly-CL 的 features 维度通常很大 (10000)，但 SVD 在 N < M 时由 N 决定
-        # 确保 H 是 Dense (Topk操作后本身就是 Dense Tensor，只是含很多0)
         self.best_ridge, self.current_gcv_score = self.select_ridge_parameter(H, Y)
         
-        # 4. 更新全局统计量
-        # G += H^T @ H
-        # Q += H^T @ Y
-        # 使用一次大矩阵乘法比循环 batch 更快
         self._G += H.T @ H
         self._Q += H.T @ Y
 
@@ -470,11 +418,8 @@ class DSCA(BaseLearner):
     
     def adjust_capacity_for_next_task(self):
         """
-        [改进版] 基于 GCV 趋势比率动态调整容量 (Parameter-Free)。
-        原理：比例控制器 (Proportional Control)。
-        公式：New_Capacity = Old_Capacity * (Current_GCV / Average_GCV)
+        New_Capacity = Old_Capacity * (Current_GCV / Average_GCV)
         """
-        # 1. 维护 GCV 历史记录
         if not hasattr(self, 'gcv_history'):
             self.gcv_history = []
         
@@ -484,34 +429,22 @@ class DSCA(BaseLearner):
         if len(self.gcv_history) == 0:
             return
 
-        # 2. 计算统计量
-        # 使用历史所有任务的平均值作为“期望难度”
         avg_gcv = np.mean(self.gcv_history)
         current_gcv = self.current_gcv_score
         
-        # 获取当前实际使用的参数量
         current_n_frq = 0
         for m in self._network.modules():
             if isinstance(m, Attention_LoRA_FFT):
-                current_n_frq = m.coef_k[self._cur_task].shape[0] # 获取当前任务实际大小
+                current_n_frq = m.coef_k[self._cur_task].shape[0]
                 break
         if current_n_frq == 0: current_n_frq = 3000 # Fallback
         
-        # 3. [核心去参逻辑] 比例缩放
-        # 如果 Current == Avg, ratio = 1.0 -> 容量不变
-        # 如果 Current > Avg (难), ratio > 1.0 -> 容量自动增加
-        # 如果 Current < Avg (易), ratio < 1.0 -> 容量自动减少
         
         ratio = current_gcv / (avg_gcv + 1e-8)
-        ratio = pow(ratio, self.args["gamma"]) # 指数平滑 (指数为1.0即线性)
+        ratio = pow(ratio, self.args["gamma"]) 
         
-        # 为了防止震荡，可以加一个平滑系数（例如开根号），或者直接用线性
-        # 这里直接用线性，因为它最符合直觉：难度翻倍，参数翻倍
         new_capacity = int(current_n_frq * ratio)
         
-        # 4. 工程上的安全边界 (不是超参，是物理限制)
-        # 上限：不能超过 expand_dim (或 dim*dim)，防止显存爆炸
-        # 下限：不能太小，导致无法学习 (例如 256)
         max_cap = 10000 
         min_cap = 256
         new_capacity = max(min_cap, min(new_capacity, max_cap))
@@ -523,5 +456,4 @@ class DSCA(BaseLearner):
         logging.info(f"[GCV-Guided Parameter-Free] Current GCV: {current_gcv:.4f} (Avg: {avg_gcv:.4f}). "
                      f"Ratio: {ratio:.2f}. Action: {action}. Next Task Capacity: {new_capacity}")
 
-        # 5. 暂存决定
         self.next_task_capacity = new_capacity

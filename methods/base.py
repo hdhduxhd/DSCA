@@ -32,10 +32,8 @@ class BaseLearner(object):
         self._device = args['device'][0]
         self._multiple_gpus = args['device']
 
-        # [新增] 存储最佳 Ridge 参数，默认值设为 1e4，后续会被 GCV 覆盖
         self.best_ridge = 1e4 
-        # [新增] 记录每个类别的样本数量，用于 SDC 更新 Ridge Q 矩阵
-        self.class_counts = torch.zeros(args.get('num_classes', 1000)).long() # 预设一个足够大的长度或者动态扩展
+        self.class_counts = torch.zeros(args.get('num_classes', 1000)).long()
 
     @property
     def exemplar_size(self):
@@ -101,7 +99,6 @@ class BaseLearner(object):
         ridge_accy = None
         if hasattr(self, '_G') and hasattr(self, '_Q'):
             ridge_weights = self._compute_ridge_weights()
-            # ridge_weights = self._compute_ridge_weights_expert()
             y_pred_ridge, y_true_ridge = self._eval_ridge(self.test_loader, ridge_weights)
             ridge_accy = self._evaluate(y_pred_ridge[:,0], y_true_ridge)
 
@@ -156,99 +153,24 @@ class BaseLearner(object):
         return np.argsort(scores, axis=1)[:, :self.topk], y_true  # [N, topk]
 
     def _compute_ridge_weights(self):
-        """计算岭回归权重 w = (G + lambda*I)^-1 Q"""
         G = self._G.to(self._device)
         Q = self._Q.to(self._device)
         
-        # 使用通过 GCV 选出的最佳参数
         ridge_lambda = self.best_ridge
         
         regularizer = ridge_lambda * torch.eye(G.size(0)).to(self._device)
         
-        # 使用 Cholesky 分解加速求解正定方程组
         try:
             L = torch.linalg.cholesky(G + regularizer)
             W_out = torch.cholesky_solve(Q, L)
         except RuntimeError:
-            # 如果数值不稳定，回退到求逆
             print("Warning: Cholesky failed, using lstsq or inv")
             W_out = torch.linalg.solve(G + regularizer, Q)
             
         return W_out
-
-    def _compute_ridge_weights_expert(self):
-        """
-        专家级方案：基于 SVD 截断的岭回归权重计算
-        解决 N approx D 时特征值过小导致的数值爆炸
-        [修改] 使用 svd 替代 eigh，并不再使用缓存
-        """
-        G = self._G.to(self._device)
-        Q = self._Q.to(self._device)
-        
-        # 1. 对 G 进行 SVD 分解
-        # G = U * S * Vh
-        # G 是协方差矩阵，理论上 U 和 Vh.T 是相同的（特征向量），S 是奇异值（特征值）
-        try:
-            # 使用 svd
-            U, S, Vh = torch.linalg.svd(G)
-        except RuntimeError:
-            logging.warning("SVD failed, falling back to Cholesky solve.")
-            return self._compute_ridge_weights() # 回退到旧方法
-
-        # 2. 谱截断 (Spectral Clipping)
-        # 设定一个阈值，小于该阈值的特征值被认为是“危险的噪声”
-        # 经验阈值：最大特征值的 1e-6 倍
-        threshold = S.max() * 1e-6
-        
-        # 3. 计算逆奇异值
-        # 使用你 GCV 选出来的最佳 lambda
-        ridge_lambda = self.best_ridge 
-        
-        # 构造对角逆矩阵向量
-        inv_s = torch.zeros_like(S)
-        mask = S > threshold
-        
-        # 关键点：只对“健康”的特征值求逆，彻底切断噪声方向
-        # 公式: 1 / (sigma + lambda)
-        inv_s[mask] = 1.0 / (S[mask] + ridge_lambda)
-        
-        # 4. 重构权重 W = (G + lambda*I)^-1 @ Q
-        # 利用 SVD 性质: G^-1 = Vh.T @ diag(1/S) @ U.T
-        # 所以 W = Vh.T @ diag(inv_s) @ U.T @ Q
-        
-        # 步骤 A: Temp = U.T @ Q  --> (D, C)
-        temp = U.T @ Q
-        
-        # 步骤 B: Scale by inverse eigenvalues (Broadcasting) --> (D, C)
-        temp = inv_s.unsqueeze(1) * temp
-        
-        # 步骤 C: W = Vh.T @ Temp --> (D, C)
-        W_out = Vh.T @ temp
-        
-        # [关键补充] 方案三：权重模长对齐 (Weight Alignment)
-        # 解决新旧任务权重 Scale 不一致导致 Acc 曲线中间凹陷的问题
-        if self._known_classes > 0 and False:
-            old_W = W_out[:, :self._known_classes]
-            new_W = W_out[:, self._known_classes:]
-            
-            # 只有当新旧类别都存在时才对齐
-            if new_W.shape[1] > 0 and old_W.shape[1] > 0:
-                old_norm = torch.norm(old_W, p=2, dim=0).mean()
-                new_norm = torch.norm(new_W, p=2, dim=0).mean()
-                
-                if new_norm > 1e-8:
-                    gamma = old_norm / new_norm
-                    # 仅做温和的对齐，防止矫枉过正
-                    W_out[:, self._known_classes:] *= gamma
-                    # logging.info(f"Weight Alignment Applied: gamma={gamma:.4f}")
-
-        return W_out
     
-    # --- [新增] Fly-CL GCV 核心算法 ---
     def select_ridge_parameter(self, Features, Y, ridge_lower=6, ridge_upper=10):
-        """
-        利用 GCV 选择最佳 lambda，并返回对应的 GCV score
-        """
+
         X = Features
         n_samples = X.shape[0]
         
@@ -262,7 +184,6 @@ class BaseLearner(object):
         
         gcv_scores = []
         for ridge in ridges:
-            # GCV 公式
             diag = S_sq / (S_sq + ridge)
             df = diag.sum()
             Y_hat = U @ (diag[:, None] * UTY)
@@ -270,50 +191,38 @@ class BaseLearner(object):
             gcv = (residual / n_samples) / (1 - df / n_samples)**2
             gcv_scores.append(gcv.item())
 
-        # 选择最佳
         optimal_idx = np.argmin(gcv_scores)
         best_lambda = ridges[optimal_idx].item()
-        best_gcv = gcv_scores[optimal_idx] # 获取最佳 GCV 分数
+        best_gcv = gcv_scores[optimal_idx] 
         
         logging.info(f"GCV Selected Ridge Lambda: {best_lambda:.2e}, GCV Score: {best_gcv:.4f}")
         
-        # 返回两个值
         return best_lambda, best_gcv
 
     def _eval_ridge(self, loader, ridge_weights):
-        """Fly-CL 风格的评估: 提取特征 -> 稀疏投影 -> TopK -> 岭回归预测"""
         self._network.eval()
         
-        # 1. 提取特征 (N, D)
         vectors, y_true = self._extract_vectors(loader)
         vectors_t = torch.tensor(vectors, dtype=torch.float32).to(self._device)
-        # [关键修改] 测试时也要归一化
         # vectors_t = F.normalize(vectors_t, p=2, dim=1) 
         
-        # 2. 稀疏随机投影 & Top-k
         if not hasattr(self, 'projection_matrix'):
             raise RuntimeError("projection_matrix not initialized for Fly-CL Ridge")
             
-        # 投影: (Expand_Dim, Emb_Dim) @ (Emb_Dim, N) -> (Expand_Dim, N)
-        # 注意 transpose 处理
         expanded = torch.sparse.mm(self.projection_matrix, vectors_t.T).T # (N, Expand_Dim)
         
-        # Top-k 稀疏化
+        # Top-k
         k = int(self.args['expand_dim']* self.args['coding_level'])
         values, indices = expanded.topk(k, dim=1, largest=True)
         sparse_feats = torch.zeros_like(expanded)
         sparse_feats.scatter_(1, indices, values)
         
-        # 3. 预测 (N, Expand_Dim) @ (Expand_Dim, Num_Classes) -> (N, Num_Classes)
         logits = torch.mm(sparse_feats, ridge_weights)
         
-        # 4. 获取 Top-k 预测 (排序为降序，得分越高越好)
         scores = logits.cpu().numpy()
-        # argsort 默认升序，取反后取前 topk
         y_pred = np.argsort(scores, axis=1)[:, ::-1][:, :self.topk]
         
         return y_pred, y_true
-    # ==============================
 
     def _extract_vectors(self, loader, task=None):
         self._network.eval()
